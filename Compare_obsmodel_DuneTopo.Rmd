@@ -1,0 +1,295 @@
+---
+title: "Compare observed and model dune topography"
+author: "Femke Batsleer"
+date: "14 april 2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Load data
+
+Field data, with predictions with INLA; interpolations with INLA  
+data from IBM model
+
+```{r message=FALSE, warning=FALSE}
+#packages
+library(tidyr)
+library(dplyr)
+library(INLA)
+library(plotly)
+library(forecast)
+library(gridExtra)
+
+#field data and predictions from INLA
+lidar_data <- read.csv("output/Data_and_predictions_INLA_fielddata.csv", sep=",")
+interlidar_data <- read.csv("output/interpolations_INLA_fielddata.csv", sep=",")
+
+#data IBM output
+ibm_data <- read.csv("data/data_model.csv", sep=",") %>% slice(-836) %>% #delete wrong (double) line
+  filter(error < 0.4) %>% #filter outlier from error
+  mutate(rep = as.factor(rep))
+```
+
+#Transform variables
+
+To get comparable values/units and scale them the same  
+
+
+```{r}
+#summary(lidar_data)
+#summary(ibm_data)
+
+#divide JC in two, than comparable to field data
+ibm_data <- ibm_data %>% mutate(JC2 = JC/2) %>% 
+  #standardize IBM data: P is from 0 to 1, so ok; Hstd scaled JC2
+  mutate(Pstd = P, Hstd = scale(JC2, center=mean(JC2), scale=sd(JC2)))
+```
+
+#Models for IBM data
+
+```{r}
+#first, get data for interpolations
+interibm_data <- tibble(Pstd=seq(0,1, by=0.01), H=seq(20,70,by=0.5)) %>%
+  tidyr::expand(Pstd, H) %>%
+  mutate(Hstd=scale(H, center=mean(ibm_data$JC2), scale=sd(ibm_data$JC2))) %>% #scale by IBM data, to get similar values
+  mutate(volume = NA, error = NA)#add empty values for volume and error
+  
+#select needed columns from ibm_data
+ibm_all <- ibm_data %>% select(Pstd, Hstd, volume, error) %>%
+  #bind with interpol data to feed it to INLA
+  bind_rows(select(interibm_data, -H))
+  
+#INLA
+#for volume
+f0_diff <- volume ~  Pstd + Hstd + Pstd:Hstd +
+  I(Pstd^2) + I(Hstd^2) +Hstd:I(Pstd^2) + Pstd:I(Hstd^2)
+M0_diff <- inla(f0_diff, 
+                #control.compute = list(dic = TRUE, waic = TRUE),
+                control.predictor = list(compute = TRUE),
+                family = "gaussian", data = ibm_all)
+summary(M0_diff)
+
+#for error
+f0_err <- error ~ Pstd + Hstd + Pstd:Hstd +
+  I(Pstd^2) + I(Hstd^2) +Hstd:I(Pstd^2) + Pstd:I(Hstd^2)
+M0_err <- inla(f0_err,
+               control.predictor = list(compute = TRUE),
+               family = "gamma", data = ibm_all)
+summary(M0_err)
+
+#save(M0_diff, file="output/M0_diff.rda")
+#save(M0_err, file="output/M0_err.rda")
+
+#extract interpolation data from IBM models
+M0_diff_inter <- M0_diff$summary.fitted.values %>%
+  slice(990:n()) %>% #select predictions from dataset that are not input data
+  select(mean, sd, `0.025quant`, `0.975quant`) %>% #select neaded values
+  #rename to get similar values as in interlidar_data
+  rename(Int_diff_mean = mean, Int_diff_sd = sd, Int_diff_0.025quant=`0.025quant`, Int_diff_0.975quant = `0.975quant`)
+
+M0_err_inter <- M0_err$summary.fitted.values %>%
+  slice(990:n()) %>% #select predictions from dataset that are not input data
+  select(mean, sd, `0.025quant`, `0.975quant`) %>% #select neaded values
+  #rename to get similar values as in interlidar_data
+  rename(Int_err_mean = mean, Int_err_sd = sd, Int_err_0.025quant=`0.025quant`, Int_err_0.975quant = `0.975quant`)
+
+
+
+#bind these interpolations/predictions to interibm_data
+interibm_data <- interibm_data %>% bind_cols(M0_diff_inter) %>% bind_cols(M0_err_inter)
+```
+
+#Effect sizes
+
+Visualisation of the effect sizes/signs of the covariates
+
+```{r fig.height=10, fig.width=12}
+#load INLA models from lidar data
+load("output/M1_diff.rda")
+load("output/M1_err.rda")
+
+#lidar data get coefficients from models
+post_beta1_diff <- M1_diff$summary.fixed[, c("mean", "0.025quant", "0.975quant")]
+post_beta1_err <- M1_err$summary.fixed[, c("mean", "0.025quant", "0.975quant")]
+
+post_beta1_diff <- post_beta1_diff %>% tibble::rownames_to_column(var="WhichVar") %>%
+  mutate(WhichVar = factor(WhichVar, levels=c("meandVstd", "Diststd",  "Pstd:I(Hstd^2)", "Hstd:I(Pstd^2)",
+                                              "I(Hstd^2)","I(Pstd^2)", "Pstd:Hstd", "Hstd", "Pstd","Intercept" ))) %>%
+  mutate(WhichVar = recode(WhichVar, "meandVstd"="meandV", "Diststd"="Dist",
+                           "Pstd:I(Hstd^2)"="P:JC²", "Hstd:I(Pstd^2)"="JC:P²",
+                           "I(Hstd^2)"="JC²","I(Pstd^2)"="P²", "Pstd:Hstd"="P:JC", "Hstd"="JC",
+                           "Pstd"="P","(Intercept)"="(Intercept)" ))
+
+post_beta1_err <- post_beta1_err %>% tibble::rownames_to_column(var="WhichVar") %>%
+  mutate(WhichVar = factor(WhichVar, levels=c("meandVstd", "Diststd",  "Pstd:I(Hstd^2)", "Hstd:I(Pstd^2)",
+                                              "I(Hstd^2)","I(Pstd^2)", "Pstd:Hstd", "Hstd", "Pstd","Intercept" )))  %>%
+  mutate(WhichVar = recode(WhichVar, "meandVstd"="meandV", "Diststd"="Dist",
+                           "Pstd:I(Hstd^2)"="P:JC²", "Hstd:I(Pstd^2)"="JC:P²",
+                           "I(Hstd^2)"="JC²","I(Pstd^2)"="P²", "Pstd:Hstd"="P:JC", "Hstd"="JC",
+                           "Pstd"="P","(Intercept)"="(Intercept)" ))
+
+#ibm data get coefficients from models
+post_beta0_diff <- M0_diff$summary.fixed[, c("mean", "0.025quant", "0.975quant")]
+post_beta0_err <- M0_err$summary.fixed[, c("mean", "0.025quant", "0.975quant")]
+
+post_beta0_diff <- post_beta0_diff %>% tibble::rownames_to_column(var="WhichVar") %>%
+  mutate(WhichVar = factor(WhichVar, levels=c("Pstd:I(Hstd^2)", "Hstd:I(Pstd^2)",
+                                              "I(Hstd^2)","I(Pstd^2)", "Pstd:Hstd", "Hstd", "Pstd","(Intercept)" ))) %>%
+  mutate(WhichVar = recode(WhichVar, "Pstd:I(Hstd^2)"="P:JC²", "Hstd:I(Pstd^2)"="JC:P²",
+         "I(Hstd^2)"="JC²","I(Pstd^2)"="P²", "Pstd:Hstd"="P:JC", "Hstd"="JC",
+         "Pstd"="P","(Intercept)"="(Intercept)" ))
+
+post_beta0_err <- post_beta0_err %>% tibble::rownames_to_column(var="WhichVar") %>%
+  mutate(WhichVar = factor(WhichVar, levels=c("Pstd:I(Hstd^2)", "Hstd:I(Pstd^2)",
+                                              "I(Hstd^2)","I(Pstd^2)", "Pstd:Hstd", "Hstd", "Pstd","(Intercept)" ))) %>%
+  mutate(WhichVar = recode(WhichVar, "Pstd:I(Hstd^2)"="P:JC²", "Hstd:I(Pstd^2)"="JC:P²",
+         "I(Hstd^2)"="JC²","I(Pstd^2)"="P²", "Pstd:Hstd"="P:JC", "Hstd"="JC",
+         "Pstd"="P","(Intercept)"="(Intercept)" ))
+
+#lidar data
+p_diff_lidar <- ggplot(post_beta1_diff) +
+  geom_pointrange() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  aes(x=WhichVar, y =mean, ymin = `0.025quant`, ymax = `0.975quant`) +
+  xlab("covariate")+ ylab("Effect size")+
+  ggtitle("Posteriors for \u0394height (LiDAR data)")+
+  theme_classic() +
+  coord_flip()
+#p_diff_lidar
+
+p_err_lidar <- ggplot(post_beta1_err) +
+  geom_pointrange() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  aes(x=WhichVar, y =mean, ymin = `0.025quant`, ymax = `0.975quant`) +
+  xlab("covariate")+ ylab("Effect size")+
+  ggtitle("Posteriors for CV(\u0394height) (LiDAR data)")+
+  theme_classic() +
+  coord_flip()
+#p_err_lidar
+
+#IBM model
+p_diff_ibm <- ggplot(post_beta0_diff) +
+  geom_pointrange() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  aes(x=WhichVar, y =mean, ymin = `0.025quant`, ymax = `0.975quant`) +
+  xlab("covariate")+ ylab("Effect size")+
+  ggtitle("Posteriors for volume (IBM data)")+
+  theme_classic() +
+  coord_flip()
+#p_diff_ibm
+
+p_err_ibm <- ggplot(post_beta0_err) +
+  geom_pointrange() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  aes(x=WhichVar, y =mean, ymin = `0.025quant`, ymax = `0.975quant`) +
+  xlab("covariate")+ ylab("Effect size")+
+  ggtitle("Posteriors for CV(volume) (IBM data)")+
+  theme_classic() +
+  coord_flip()
+#p_err_ibm
+
+grid.arrange(p_diff_ibm, p_err_ibm, p_diff_lidar, p_err_lidar)
+```
+
+#Visualisation of the interpolations
+
+3D graphs for both the model and lidar data  
+
+Difference (height/volume): lijkt me bij combinate hoge P en H en kleine P en H enkel verschillend van elkaar. Bij lidar data gaat bij hoge P en H gaat difference ferm naar beneden, bij IBM data niet. Bij lage P en H gaat bij ibm data de difference naar omhoog, bij lidar data weer naar beneden. Bij de niet extreme waarden lijkt het wel goed overeen te komen (zou eens apart kunnen geplot worden).  
+
+Error: zadelprofiel bij ibm data, bij lidar data niet aanwezig (grote en kleine waarden van H)...
+
+```{r}
+#3Dplot
+#Lidar data
+Interlidar_diff_3D <- plot_ly(data = interlidar_data, x = ~H, y = ~Pstd, z=~Int_diff_mean, color=~Int_diff_mean)  %>% add_markers() %>%
+  layout(title = "Difference in dune height (LiDAR data)",
+  scene = list(
+    xaxis = list(title = "JC"),
+    yaxis = list(title = "P", tickvals=c(0,0.2,0.4,0.6,0.8,1)),
+    zaxis = list(title = "\u0394height (m)", titleangle=90))) %>%
+  colorbar(title = "Prediction \u0394height")
+
+
+Interlidar_err_3D <- plot_ly(data = interlidar_data, x = ~H, y = ~Pstd, z=~exp(Int_err_mean), color=~exp(Int_err_mean))  %>% add_markers() %>%
+  layout(title = "Variability in dune height (LiDAR data)",
+  scene = list(
+    xaxis = list(title = "JC"),
+    yaxis = list(title = "P", tickvals=c(0,0.2,0.4,0.6,0.8,1)),
+    zaxis = list(title = "CV (m)"))) %>%
+  colorbar(title = "Prediction CV")
+
+
+
+#IBM model
+Interibm_diff_3D <- plot_ly(data = interibm_data, x = ~H, y = ~Pstd, z=~Int_diff_mean, color=~Int_diff_mean)  %>% add_markers() %>%
+  layout(title = "Difference in dune volume (IBM data)",
+  scene = list(
+    xaxis = list(title = "JC"),
+    yaxis = list(title = "P", tickvals=c(0,0.2,0.4,0.6,0.8,1)),
+    zaxis = list(title = "volume (m³)"))) %>%
+  colorbar(title = "Prediction volume")
+
+
+Interibm_err_3D <- plot_ly(data = interibm_data, x = ~H, y = ~Pstd, z=~exp(Int_err_mean), color=~exp(Int_err_mean))  %>% add_markers() %>%
+  layout(title = "Variability in dune volume (IBM data)",
+  scene = list(
+    xaxis = list(title = "JC"),
+    yaxis = list(title = "P", tickvals=c(0,0.2,0.4,0.6,0.8,1)),
+    zaxis = list(title = "CV (m³)"))) %>%
+  colorbar(title = "Prediction CV")
+
+
+
+Interlidar_diff_3D
+Interibm_diff_3D
+
+
+Interlidar_err_3D
+Interibm_err_3D
+```
+
+#Plotting uncertainties
+
+```{r}
+#3Dplot
+#Lidar data
+Interlidar_diff_3D_uncertainty <- plot_ly(data = interlidar_data, x = ~H, y = ~Pstd, z=~Int_diff_mean, color=~(Int_diff_0.975quant - Int_diff_0.025quant))  %>% add_markers() %>%
+  layout(title = "Uncertainty Difference (lidar data)",
+  scene = list(
+    xaxis = list(title = "JC"),
+    yaxis = list(title = "P", tickvals=c(0,0.2,0.4,0.6,0.8,1)),
+    zaxis = list(title = "Height (m)")))
+
+Interlidar_err_3D_uncertainty <- plot_ly(data = interlidar_data, x = ~H, y = ~Pstd, z=~exp(Int_err_mean), color=~exp(Int_err_0.975quant-Int_err_0.025quant))  %>% add_markers() %>%
+  layout(title = "Uncertainty Variability (lidar data)",
+  scene = list(
+    xaxis = list(title = "JC"),
+    yaxis = list(title = "P"),
+    zaxis = list(title = "Error (m)")))
+
+Interibm_diff_3D_uncertainty <- plot_ly(data = interibm_data, x = ~H, y = ~Pstd, z=~Int_diff_mean, color=~(Int_diff_0.975quant - Int_diff_0.025quant))  %>% add_markers() %>%
+  layout(title = "Uncertainty volume (ibm data)",
+  scene = list(
+    xaxis = list(title = "JC"),
+    yaxis = list(title = "P"),
+    zaxis = list(title = "Height (m)")))
+
+Interibm_err_3D_uncertainty <- plot_ly(data = interibm_data, x = ~H, y = ~Pstd, z=~exp(Int_err_mean), color=~exp(Int_err_0.975quant-Int_err_0.025quant))  %>% add_markers() %>%
+  layout(title = "Uncertainty variability (ibm data)",
+  scene = list(
+    xaxis = list(title = "JC"),
+    yaxis = list(title = "P"),
+    zaxis = list(title = "Error (m)")))
+
+
+Interlidar_diff_3D_uncertainty
+Interibm_diff_3D_uncertainty
+
+Interlidar_err_3D_uncertainty
+Interibm_err_3D_uncertainty
+```
+

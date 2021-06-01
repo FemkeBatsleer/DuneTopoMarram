@@ -1,0 +1,724 @@
+---
+title: "ObservedDuneTopoMarram_INLA"
+author: "Femke Batsleer"
+date: "19 januari 2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+library(ggplot2)
+
+library(forcats)
+library(dplyr)
+library(tidyr)
+library(lme4)
+library(GGally)
+library(lattice)
+library(INLA)
+library(gstat)
+library(fields)
+library(reshape)
+library(rgdal)
+library(rgeos)
+library(gridExtra)
+library(plotly)
+```
+
+#Loading dataset
+
+```{r}
+#Topo lidar data#
+topo_df <- read.csv("data/lidar_final_spatialjoin.csv") %>%
+  select(-ID_sectie, -join_KRIBV, -join_KD, -join_KD_nr, -join_Opp_m, -distance) #delete redundant data
+nrow(topo_df)
+colnames(topo_df)
+
+#data for H (joint count, H, of Marram)
+jc_df <- read.csv("data/BE_joincount_2.csv") %>% 
+  filter(CLASS==6) %>%#filter the marram-values; marram is class 6
+  select(STD_DEVIATE, gridcell)
+
+#data for P (proportion of Marram)
+p_df <- read.csv("data/BE_classtat_2.csv") %>%
+  filter(class==6) %>%#filter the marram-values; marram is class 6
+  select(prop.landscape, gridcell)
+  
+#joining the datasets
+vegetation <- topo_df %>% left_join(jc_df, by="gridcell") %>%
+  left_join(p_df, by="gridcell")
+
+#filter only cells with marram_sand_prop > 0.75 and delete NA's
+vegetation <- vegetation %>% filter(marram_san >= 0.75) %>%
+  drop_na()
+
+#write.csv(vegetation_sel, "filtered_lidar_final.csv") #to check spatially the filtered data in QGIS
+
+#renaming the data
+vegetation <- vegetation %>%
+  rename(H=STD_DEVIATE, P=prop.landscape, ID_sectie=join_ID)
+
+#standardizing covariates P, H #P is between 0 and 1 so ok
+vegetation <- vegetation %>% mutate(Pstd=P) %>%
+  mutate(Hstd=scale(H, center=mean(H), scale=sd(H))) %>%
+  mutate(Diststd=scale(dist_HW, center=mean(dist_HW), scale=sd(dist_HW))) %>%
+  #mutating X and Y into km
+  mutate(Xkm = X/1000, Ykm=Y/1000)
+
+head(vegetation)
+nrow(vegetation)
+
+#data for sand suppletion#
+#get suppletion data
+suppletions <- read.csv("data/volumes_droogstrand.csv", sep=";") %>%
+  #only get values from 2015-2019
+  filter(survey.datum %in% c("17/05/2015", "10/04/2016", "26/05/2017", "17/04/2018", "20/04/2019")) %>% 
+  gather(ID_sectie, dV, X1:X266) %>%
+  group_by(ID_sectie) %>% summarise(meandV=mean(dV)) %>% #calculate average of dV
+  separate(ID_sectie, into=c("X", "ID_sectie"), sep="X") %>%
+  mutate(ID_sectie=as.numeric(ID_sectie)) %>%
+  select(-X) %>% arrange(ID_sectie)
+head(suppletions)
+
+vegetation <- vegetation %>% left_join(suppletions, by="ID_sectie") %>% #get suppletion value into dataset
+  mutate(meandVstd = scale(meandV)) #standardize it
+```
+
+#Data exploration
+
+```{r}
+#1. Outliers
+#Cleveland dotcharts see Zuur et al 2010 doi: 10.1111/j.2041-210X.2009.00001.x
+par(mfrow = c(1,4))
+dotchart(vegetation$P, main="P")
+dotchart(vegetation$H, main="H")
+dotchart(vegetation$mean_diff, main="mean_diff") #maybe two outlier in mean_diff on the left
+dotchart(vegetation$sd_diff, main="sd_diff")
+dotchart(vegetation$meandV, main="dV")
+
+#2. Multicollinearity between covariates
+#correlation
+par(mfrow=c(1,1))
+plot(Hstd~Pstd, data=vegetation) #-->bit of a parabolic relation?
+plot(H~P, data=vegetation)
+# myVars <- vegetation[,c("Hstd", "Pstd")]
+# ggpairs(myVars)
+
+#3. Relationships Y~X
+par(mfrow=c(2,2))
+plot(mean_diff~Hstd, data=vegetation)#centered around zero
+plot(mean_diff~Pstd, data=vegetation)#centered around zero
+plot(sd_diff~Hstd, data=vegetation)#parabolic?
+plot(sd_diff~Pstd, data=vegetation)#maybe linear, depends on noise
+
+plot(mean_diff~meandVstd, data=vegetation)
+plot(sd_diff~meandVstd, data=vegetation)
+plot(mean_diff~H, data=vegetation)
+plot(mean_diff~P, data=vegetation)
+
+
+#4. spatial plot
+xyplot(Ykm~Xkm, data=vegetation,
+       aspect = "iso", col = 1, pch = 16)
+
+#5. which kind of regression?
+par(mfrow=c(1,1))
+hist(vegetation$mean_diff, breaks=seq(-15,6,0.5) ) #Gaussian
+hist(vegetation$sd_diff, breaks=seq(0,6,0.1) ) #gamma GLM with log-link, for >0 data
+```
+
+
+#Non-spatial model with INLA
+
+```{r}
+#for mean_diff
+f0_diff <- mean_diff ~ Pstd + Hstd + Pstd:Hstd +
+  I(Pstd^2) + I(Hstd^2) +Hstd:I(Pstd^2) + Pstd:I(Hstd^2) + Diststd + meandVstd
+M0_diff <- inla(f0_diff, control.compute = list(dic = TRUE, waic = TRUE),
+                family = "gaussian", data = vegetation)
+summary(M0_diff)
+
+#for sd_diff
+f0_err <- sd_diff ~ Pstd + Hstd + Pstd:Hstd +
+  I(Pstd^2) + I(Hstd^2) +Hstd:I(Pstd^2) + Pstd:I(Hstd^2) + Diststd + meandVstd
+M0_err <- inla(f0_err, control.compute = list(dic = TRUE, waic = TRUE),
+               #verbose=TRUE,
+               family = "gamma", data = vegetation)
+summary(M0_err)
+
+##Checking assumptions
+#residuals
+Fit0_diff <- M0_diff$summary.fitted.values[1:nrow(vegetation),"mean"]
+E0_diff   <- vegetation$mean_diff - Fit0_diff
+
+Fit0_err <- M0_err$summary.fitted.values[1:nrow(vegetation),"mean"]
+E0_err <- vegetation$sd_diff - Fit0_err
+
+plot_assump <- function(Fit0, E0){
+  par(mfrow=c(2,2))
+  # Homogeneity
+  plot(x = Fit0, y = E0)
+  abline(h = 0, v = 0)
+  # Normality
+  hist(E0, breaks = 25)
+  # Independence due to model misfit
+  plot(x = vegetation$P, y = E0)
+  abline(h = 0)
+  plot(x=vegetation$Hstd, y = E0)
+  abline(h = 0)
+}
+
+plot_assump(Fit0_diff, E0_diff)
+plot_assump(Fit0_err, E0_err)
+
+#Variogram to look at spatial autocorrelation
+##Semivariogram of residuals
+vegetation <- vegetation %>% mutate(
+  mu0_diff = M0_diff$summary.fitted.values$mean,
+  Var0_diff = (M0_diff$summary.fitted.values$sd)^2,
+  Res_diff = mean_diff-mu0_diff, #Pearson's residuals, for Generalized LM, would be /sqrt(Var0)
+  mu0_err = M0_err$summary.fitted.values$mean,
+  Res_err = mean_diff-mu0_err)
+
+V0_diff <- variogram(Res_diff ~ 1, locations = ~Xkm + Ykm,
+                     data = as.data.frame(vegetation), cressie = TRUE,
+                     cutoff=5)
+V0_err <- variogram(Res_err ~ 1, locations = ~Xkm + Ykm,
+                    data = as.data.frame(vegetation), cressie = TRUE,
+                    cutoff=5)
+
+plot_spatialres <- function(Res){
+  ##Spatial pattern in residuals?
+  #plotting on map
+  MyCex <- 3*abs(Res)/max(Res) +0.5
+  Sign <- as.numeric(Res>=0)+1
+  MyPch <- c(1,16)[Sign]
+  xyplot(Ykm~Xkm, data=vegetation, aspect="iso",
+         cex=MyCex, pch=MyPch, col=MyPch)
+}
+
+#spatial plot for mean_diff
+plot(V0_diff)
+plot_spatialres(Res=vegetation$Res_diff)
+
+#spatial plot for sd_diff
+plot(V0_err)
+plot_spatialres(Res=vegetation$Res_err)
+
+
+#fitted data vs real data
+p_pred_diff <- ggplot(data= vegetation, aes(x=mean_diff, y=mu0_diff))+
+  geom_point()+
+  geom_abline(intercept=0, slope=1, linetype="longdash", color='red')+
+  ggtitle("Prediciton ~ Real value for mean_diff")
+p_pred_err <- ggplot(data=vegetation, aes(x=sd_diff, y=exp(mu0_err)) )+
+  geom_point()+
+  geom_abline(intercept=0, slope=1, linetype="longdash", color="red")+
+  ggtitle("Prediciton ~ Real value for sd_diff")
+
+par(mfrow=c(1,2))
+p_pred_diff
+p_pred_err
+```
+
+#Spatial model with INLA
+
+```{r}
+#check distribution of distances between datapoints
+Loc <- cbind(vegetation$Xkm, vegetation$Ykm)
+D <- dist(Loc)
+hist(D,freq = TRUE, main = "",
+     xlab = "Distance between sites (km)",
+     ylab = "Frequency")
+abline(v = 50, lty = 2, col = 2)
+plot(x = sort(D),
+     y = (1:length(D))/length(D),
+     type = "l",
+     xlab = "Distance between sites (km)",
+     ylab = "Cumulative proportion")
+abline(h = 0.1, lty = 2, col = 2)
+
+#make a mesh (to approximate spatial field on)
+RangeGuess_diff <- 1
+MaxEdge_diff <- RangeGuess_diff / 5
+mesh_diff <- inla.mesh.2d(Loc,max.edge = c(3,5)*MaxEdge_diff, cutoff = MaxEdge_diff/5)#good way to start according to Zuur INLA book
+plot(mesh_diff, asp=1)
+mesh_diff$n
+
+RangeGuess_err <- 1
+MaxEdge_err <- RangeGuess_err/5
+mesh_err <- inla.mesh.2d(Loc, max.edge = c(3,5)*MaxEdge_err, cutoff = MaxEdge_err/5)
+mesh_err$n
+
+#2. making a stack (to link mesh with data)
+A_diff <- inla.spde.make.A(mesh_diff, loc = Loc)
+A_err <- inla.spde.make.A(mesh_err, loc=Loc)
+spde_diff <- inla.spde2.pcmatern(mesh_diff, prior.range = c(1, 0.5), prior.sigma = c(1.6, 0.05))#Differnce [-2.8,3.6] range/4
+spde_err  <- inla.spde2.pcmatern(mesh_err,  prior.range = c(1, 0.5), prior.sigma = c(1.375, 0.05))#sd_diff [0.015, 5.5]
+
+w1.index_diff <- inla.spde.make.index('w', n.spde = spde_diff$n.spde)
+w1.index_err <- inla.spde.make.index('w', n.spde = spde_err$n.spde)
+
+Xm <- model.matrix(~ Pstd * Hstd * Diststd*meandVstd, data = vegetation)
+N <- nrow(vegetation)
+X <- data.frame(Pstd = Xm[,2], Hstd = Xm[,3], Diststd= Xm[,4], meandVstd=Xm[,5])
+
+Stack1_diff <- inla.stack(tag = "Fit", data = list(y = vegetation$mean_diff),  
+                          A = list(1, 1, A_diff), effects = list(Intercept = rep(1, N),
+                                                                 X = as.data.frame(X), w = w1.index_diff))
+Stack1_err <- inla.stack(tag = "Fit", data = list(y = vegetation$sd_diff),  
+                         A = list(1, 1, A_err), effects = list(Intercept = rep(1, N),
+                                                               X = as.data.frame(X), w = w1.index_err))
+
+#predictions have to be calculated during model fitting with inla (inlabru can do it afterwards)
+#predictions are calculated for a 'average' spatial position
+#so A doesn't have the spatial components of the spde
+Stackpred_diff <- inla.stack(tag = "Covariates", data = list(y = NA),
+                             A = list(1, 1), effects = list(Intercept = rep(1, N),
+                                                            Xp = as.data.frame(X)))
+Stackpred_err <- inla.stack(tag = "Covariates", data = list(y = NA),
+                            A = list(1, 1), effects = list(Intercept = rep(1, N),
+                                                           Xp = as.data.frame(X)))
+
+#interpolations for prediction surface
+interpol_df <- tibble(Pstd=seq(0,1, by=0.01), H=seq(20,70,by=0.5)) %>%
+  tidyr::expand(Pstd, H) %>%
+  mutate(Hstd=scale(H, center=mean(vegetation$H), scale=sd(vegetation$H))) %>%
+  tibble::add_column(Diststd = mean(vegetation$Diststd)) %>%#give mean distHW
+  tibble::add_column(meandVstd = mean(vegetation$meandVstd))#give mean suppletion meandV
+
+Xm_inter <- model.matrix(~ Pstd * Hstd * Diststd * meandVstd, data = interpol_df)
+N_inter <- nrow(interpol_df)
+X_inter <- data.frame(Pstd = Xm_inter[,2], Hstd = Xm_inter[,3], Diststd= Xm_inter[,4], meandVstd=Xm_inter[,5])
+
+####TO ADD#####  
+Stackinter_diff  <- inla.stack(tag= "Interpolations", data = list(y = NA),
+                               A = list(1, 1), effects = list(Intercept = rep(1, N_inter),
+                                                              Xi = as.data.frame(X_inter)))
+Stackinter_err <- inla.stack(tag= "Interpolations", data = list(y = NA),
+                               A = list(1, 1), effects = list(Intercept = rep(1, N_inter),
+                                                              Xi = as.data.frame(X_inter)))
+
+Stack_diff <- inla.stack(Stack1_diff, Stackpred_diff, Stackinter_diff)
+Stack_err  <- inla.stack(Stack1_err,  Stackpred_err, Stackinter_err)
+
+#3. specify model formula
+f_diff <- y ~ -1 + Intercept + Pstd + Hstd + Pstd:Hstd + I(Pstd^2) + I(Hstd^2) +
+  Hstd:I(Pstd^2) + Pstd:I(Hstd^2) + Diststd + meandVstd +
+  f(w, model=spde_diff)
+
+f_err <- y ~ -1 + Intercept + Pstd + Hstd + Pstd:Hstd + I(Pstd^2) + I(Hstd^2) +
+  Hstd:I(Pstd^2) + Pstd:I(Hstd^2) + Diststd + meandVstd +
+  f(w, model=spde_err)
+
+M1_diff <- inla(f_diff, family = "gaussian", data = inla.stack.data(Stack_diff),
+                control.compute = list(dic = TRUE, config=TRUE), 
+                #control.family = list(hyper = list(prec = list(param = c(1, 0.2)))),
+                control.predictor = list(A = inla.stack.A(Stack_diff)))
+M1_err <- inla(f_err, family = "gamma", data = inla.stack.data(Stack_err),
+               control.compute = list(dic = TRUE, config=TRUE), #verbose=TRUE,
+               control.predictor = list(A = inla.stack.A(Stack_err)))
+
+summary(M1_diff)
+summary(M1_err)
+
+#save the mesh and models to load later, as these models take long to run
+#save(mesh_diff, file="output/mesh_diff.rda")
+#save(mesh_err, file="output/mesh_err.rda")
+#save(M1_diff, file="output/M1_diff.rda")
+#save(M1_err, file="output/M1_err.rda")
+
+###Plotting spatial autocorrelation of residuals
+##Fitted values and residuals
+#index of the fitted values
+indexFit_diff <- inla.stack.index(Stack_diff, tag = "Fit")$data #fitted data (with SAC)
+indexCov_diff <- inla.stack.index(Stack_diff, tag = "Covariates")$data #predictions
+indexInt_diff <- inla.stack.index(Stack_diff, tag = "Interpolations")$data #interpolations
+
+indexFit_err  <- inla.stack.index(Stack_err,  tag= "Fit")$data
+indexCov_err  <- inla.stack.index(Stack_err,  tag="Covariates")$data
+indexInt_err  <- inla.stack.index(Stack_err,  tag="Interpolations")$data 
+
+#Difference
+vegetation$Fit_diff_sp <- M1_diff$summary.fitted.values[indexFit_diff,"mean"]
+vegetation$Pred_diff_sp <- M1_diff$summary.fitted.values[indexCov_diff, "mean"]
+vegetation$Res_diff_sp   <- vegetation$mean_diff - vegetation$Fit_diff_sp
+interpol_df$Int_diff_mean <- M1_diff$summary.fitted.values[indexInt_diff, "mean"]
+interpol_df$Int_diff_sd <- M1_diff$summary.fitted.values[indexInt_diff, "sd"]
+interpol_df$Int_diff_0.025quant <- M1_diff$summary.fitted.values[indexInt_diff, "0.025quant"]
+interpol_df$Int_diff_0.975quant <- M1_diff$summary.fitted.values[indexInt_diff, "0.975quant"]
+
+#Error
+vegetation$Fit_err_sp <- M1_err$summary.fitted.values[indexFit_err, "mean"]
+vegetation$Pred_err_sp <- M1_err$summary.fitted.values[indexCov_err, "mean"]
+vegetation$Res_err_sp <- vegetation$sd_diff - vegetation$Fit_err_sp
+interpol_df$Int_err_mean <- M1_err$summary.fitted.values[indexInt_err, "mean"]
+interpol_df$Int_err_sd <- M1_diff$summary.fitted.values[indexInt_err, "sd"]
+interpol_df$Int_err_0.025quant <- M1_err$summary.fitted.values[indexInt_err, "0.025quant"]
+interpol_df$Int_err_0.975quant <- M1_err$summary.fitted.values[indexInt_err, "0.975quant"]
+
+#calculate variogram
+V0_diff <- variogram(Res_diff ~ 1, locations=~Xkm + Ykm,
+                     data=as.data.frame(vegetation), cressie=T, cutoff=1)
+V1_diff <- variogram(Res_diff_sp ~ 1, locations = ~Xkm + Ykm,
+                     data = as.data.frame(vegetation), cressie = TRUE, cutoff=1)
+
+V0_err <- variogram(Res_err ~ 1, locations=~Xkm + Ykm,
+                    data=as.data.frame(vegetation), cressie=T, cutoff=1)
+V1_err <- variogram(Res_err_sp ~ 1, locations = ~Xkm + Ykm,
+                    data = as.data.frame(vegetation), cressie = TRUE, cutoff=1)
+
+#plotting variograms
+p_variogram_diff <- ggplot() + 
+  geom_point(data = V0_diff, aes(x = dist, y = gamma)) + 
+  geom_line(data = V0_diff, aes(x = dist, y = gamma),col = "red")+
+  geom_point(data = V1_diff,aes(x = dist, y = gamma)) + 
+  geom_line(data = V1_diff,aes(x = dist, y = gamma),col = "blue")+
+  #scale_x_continuous(limits=c(0,50))+
+  ggtitle("Semi-variogram for mean_diff")+
+  xlab("Distance (km)") +
+  ylab("Cressie's Semi-variance") + 
+  theme(text = element_text(size = 15)) + 
+  theme_classic()
+  #theme(legend.position="none")  
+#ylim(0,1.5)
+p_variogram_diff
+
+p_variogram_err <- ggplot() +
+  geom_point(data = V0_err, aes(x = dist, y = gamma)) +
+  geom_line(data = V0_err, aes(x = dist, y = gamma),col = "red")+
+  geom_point(data = V1_err,aes(x = dist, y = gamma)) +
+  geom_line(data = V1_err,aes(x = dist, y = gamma),col = "blue")+
+  #scale_x_continuous(limits=c(0,50))+
+  ggtitle("Semi-variogram for sd_diff")+
+  xlab("Distance") +
+  ylab("Cressie's Semi-variance") +
+  theme(text = element_text(size = 15)) +
+  theme_classic()
+  #theme(legend.position="none")
+#ylim(0,1.5)
+p_variogram_err
+
+#plotting spatial autocorrelation on map
+Fit_diff_sp <- vegetation$Fit_diff_sp
+Res_diff_sp <- vegetation$Res_diff_sp
+
+MyCex <- 3*abs(Res_diff_sp)/max(Res_diff_sp) +0.5
+Sign <- as.numeric(Res_diff_sp>=0)+1
+MyPch <- c(1,16)[Sign]
+xyplot(Ykm~Xkm, data=vegetation, aspect="iso",
+       cex=MyCex, pch=MyPch, col=MyPch, main="Residuals Diff, color is sign, size~size")
+
+Fit_err_sp <- vegetation$Fit_err_sp
+Res_err_sp <- vegetation$Res_err_sp
+
+MyCex <- 3*abs(Res_err_sp)/max(Res_err_sp) +0.5
+Sign <- as.numeric(Res_err_sp>=0)+1
+MyPch <- c(1,16)[Sign]
+xyplot(Ykm~Xkm, data=vegetation, aspect="iso",
+       cex=MyCex, pch=MyPch, col=MyPch, main="Residuals sd_diff, color is sign, size~size")
+
+###Checking assumptions for spatial model####
+plot_assump <- function(Fit0, E0){
+  par(mfrow=c(2,2))
+  # Homogeneity
+  plot(x = Fit0, y = E0)
+  abline(h = 0, v = 0)
+  # Normality
+  hist(E0, breaks = 25)
+  # Independence due to model misfit
+  plot(x = vegetation$Pstd, y = E0)
+  abline(h = 0)
+  plot(x=vegetation$Hstd, y = E0)
+  abline(h = 0)
+}
+
+plot_assump(vegetation$Fit_diff_sp, vegetation$Res_diff_sp)
+plot_assump(vegetation$Fit_err_sp, vegetation$Res_err_sp)
+
+
+#Fitted data (with correction for SAR added to the data)
+p_fit_diff <- ggplot(data= vegetation, aes(x=mean_diff, y=Fit_diff_sp))+
+  geom_point()+
+  geom_abline(intercept=0, slope=1, linetype="longdash", color='red')+
+  ggtitle("Fitted values ~ Real value for mean_diff")
+p_fit_err <- ggplot(data= vegetation, aes(x=sd_diff, y=Fit_err_sp))+
+  geom_point()+
+  geom_abline(intercept=0, slope=1, linetype="longdash", color='red')+
+  ggtitle("Fitted values ~ Real value for sd_diff")
+
+p_fit_diff
+p_fit_err
+
+#predicted data (SAR not added, but only used to estimate the fixed effects; these are the kind of predictions possible for extrapolation)
+p_pred_diff <- ggplot(data= vegetation, aes(x=mean_diff, y=Pred_diff_sp))+
+  geom_point()+
+  geom_abline(intercept=0, slope=1, linetype="longdash", color='red')+
+  ggtitle("Predicted values ~ Real value for mean_diff")
+p_pred_err <- ggplot(data= vegetation, aes(x=sd_diff, y=exp(Pred_err_sp)))+
+  geom_point()+
+  geom_abline(intercept=0, slope=1, linetype="longdash", color='red')+
+  ggtitle("Predicted values ~ Real value for sd_diff")
+
+p_pred_diff
+p_pred_err
+```
+
+#Regression coefficients
+
+```{r}
+###mean_diff
+
+post_beta0_diff <- M0_diff$summary.fixed[, c("mean", "0.025quant", "0.975quant")]
+post_beta1_diff <- M1_diff$summary.fixed[, c("mean", "0.025quant", "0.975quant")]
+
+NumberOfBetas <- nrow(M1_diff$summary.fixed) 
+Combined <- rbind(post_beta0_diff, post_beta1_diff)
+Combined$WhichModel <- rep(c("Non-spatial", "Spatial"),each = NumberOfBetas)
+Combined$WhichVariable <- rep(rownames(M1_diff$summary.fixed), 2)
+colnames(Combined) <- c("Mean", "Lo", "Up", "WhichModel", "WhichVariable")
+Combined
+
+p_posteriors_diff <- ggplot() + 
+  geom_point(data = Combined, aes(x = WhichModel, y = Mean))+ 
+  geom_errorbar(data = Combined, aes(x = WhichModel, ymax = Up, ymin = Lo, color=WhichModel), width=0.2)+
+  xlab("Parameters") + ylab("Values")+
+  geom_hline(yintercept=0, linetype="dashed", color="red")+
+  theme(text = element_text(size = 15)) +
+  facet_wrap( ~ WhichVariable, scales = "free_y")+
+  theme(legend.position="none") +
+  ggtitle("Posteriors (effect sizes) for mean_diff")
+p_posteriors_diff
+
+p_diff <- ggplot(filter(Combined, WhichModel=="Spatial") %>% mutate(WhichVariable = fct_reorder(WhichVariable, Mean))) +
+  geom_pointrange() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  aes(x = WhichVariable, y =Mean, ymin = Lo, ymax = Up) +
+  xlab("covariate")+ ylab("Effect size")+
+  ggtitle("Posteriors (effect sizes) for mean_diff")+
+# 
+#   scale_color_manual(values = c("SLA1" = "#66CD00",
+#                                 "SLA2" = "#cfefb0")) +
+  theme_classic() +
+  coord_flip()
+p_diff
+
+###sd_diff
+post_beta0_err <- M0_err$summary.fixed[, c("mean", "0.025quant", "0.975quant")]
+post_beta1_err <- M1_err$summary.fixed[, c("mean", "0.025quant", "0.975quant")]
+
+NumberOfBetas <- nrow(M1_err$summary.fixed)
+Combined <- rbind(post_beta0_err, post_beta1_err)
+Combined$WhichModel <- rep(c("Non-spatial", "Spatial"),each = NumberOfBetas)
+Combined$WhichVariable <- rep(rownames(M1_err$summary.fixed), 2)
+colnames(Combined) <- c("Mean", "Lo", "Up", "WhichModel", "WhichVariable")
+# Combined
+
+p_posteriors_err <- ggplot() +
+  geom_point(data = Combined, aes(x = WhichModel, y = Mean))+
+  geom_errorbar(data = Combined, aes(x = WhichModel, ymax = Up, ymin = Lo, color=WhichModel), width=0.2)+
+  xlab("Parameters") + ylab("Values")+
+  geom_hline(yintercept=0, linetype="dashed", color="red")+
+  theme(text = element_text(size = 15)) +
+  facet_wrap( ~ WhichVariable, scales = "free_y")+
+  theme(legend.position="none")+
+  ggtitle("Posteriors (effect sizes) for sd_diff")
+p_posteriors_err
+
+
+p_err <- ggplot(filter(Combined, WhichModel=="Spatial") %>% mutate(WhichVariable = fct_reorder(WhichVariable, Mean))) +
+  geom_pointrange() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  aes(x = WhichVariable, y =Mean, ymin = Lo, ymax = Up) +
+  xlab("covariate")+ ylab("Effect size")+
+  ggtitle("Posteriors (effect sizes) for sd_diff")+
+# 
+#   scale_color_manual(values = c("SLA1" = "#66CD00",
+#                                 "SLA2" = "#cfefb0")) +
+  theme_classic() +
+  coord_flip()
+p_err
+```
+
+#Plots of spatial field
+
+```{r}
+###Spatial field plots####
+#contour
+DSN <- "data/Study_Area_westkust.shp"
+boundary <- readOGR(dsn = DSN, layer = "data/Study_Area_westkust")
+x1 <- c(22100, 22100, 39900, 39900) 
+y1 <- c(198700, 209000, 209000, 198700)
+# Make a polygon of it.
+AreaPoly <- Polygon(cbind(x1, y1), hole = FALSE)
+AreaSP   <- SpatialPolygons(list(Polygons(list(AreaPoly), ID = '1')))
+AreaSP@proj4string  <- boundary@proj4string
+#define what outside the raster
+Outraster <- gDifference(AreaSP, boundary)
+#plot(Outraster)
+
+##Spatial field for mean_diff##
+w.pm <- M1_diff$summary.random$w$mean
+w.proj <- inla.mesh.projector(mesh_diff)
+w.pmf <- inla.mesh.project(w.proj, w.pm)
+
+
+xygrid <- expand.grid(w.proj$x, w.proj$y)
+Data3D <- data.frame(x = xygrid[,1],
+                     y = xygrid[,2],
+                     z = melt(w.pmf)[,3])
+names(Data3D) <- c("x", "y", "z")
+#Data3D <- Data3D %>% filter((x>=22.100 & x<=81.200) & (y>=197.600 & y<=229.800))
+
+p_sf_diff <- ggplot(Data3D, 
+                    aes(x, y, z = z),
+                    col = rgb(1, 0.5, 0.5, 0.7)) +
+  stat_contour(geom="polygon", aes(fill = ..level..)) +
+  geom_raster(aes(fill = z)) +
+  labs(fill="w.pm")+
+  # xlim(23231,23332)+
+  # ylim(197851,197902)+
+  geom_polygon(data=fortify(Outraster), aes(x=long/1000, y=lat/1000),
+               #fill="white",
+               alpha=0.5,
+               color="white", inherit.aes=FALSE)+
+  #geom_polygon(data=fortify(Outraster), aes(x=lat, y=long, z=NULL), color="black", fill=NA)+
+  #stat_contour(geom="polygon", aes(fill = ..level..)) +
+  #stat_contour(aes(colour = ..level..))+
+  xlab("x (Km)")+
+  ylab("y (Km)")+
+  xlim(c(22.100, 39.900))+
+  ylim(c(198.700, 209.000))+
+  scale_fill_distiller(palette="PuOr")+
+  theme_classic()+
+  coord_fixed(ratio = 1)
+p_sf_diff
+
+
+
+##Spatial field for sd_diff#
+w.pm <- M1_err$summary.random$w$mean
+w.proj <- inla.mesh.projector(mesh_err)
+w.pmf <- inla.mesh.project(w.proj, w.pm)
+
+
+xygrid <- expand.grid(w.proj$x, w.proj$y)
+Data3D <- data.frame(x = xygrid[,1],
+                     y = xygrid[,2],
+                     z = melt(w.pmf)[,3])
+names(Data3D) <- c("x", "y", "z")
+
+p_sf_err <- ggplot(Data3D,
+                   aes(x, y, z = z),
+                   col = rgb(1, 0.5, 0.5, 0.7)) +
+  stat_contour(geom="polygon", aes(fill = ..level..)) +
+  geom_raster(aes(fill = z)) +
+  labs(fill="w.pm")+
+  # xlim(23231,23332)+
+  # ylim(197851,197902)+
+  geom_polygon(data=fortify(Outraster), aes(x=long/1000, y=lat/1000),
+               #fill="white",
+               alpha=0.5,
+               color="white", inherit.aes=FALSE)+
+  #geom_polygon(data=fortify(Outraster), aes(x=lat, y=long, z=NULL), color="black", fill=NA)+
+  #stat_contour(geom="polygon", aes(fill = ..level..)) +
+  #stat_contour(aes(colour = ..level..))+
+  xlab("x (m)")+
+  ylab("y (m)")+
+  xlim(c(22.100, 39.900))+
+  ylim(c(198.700, 209.000))+
+  scale_fill_distiller(palette="PuOr")+
+  theme_classic()+
+  coord_fixed(ratio = 1)
+p_sf_err
+```
+
+#Predictions ~ raw data of H and P
+
+```{r}
+#####Predicties ~ covariates
+p_pred_diff_P <- ggplot(data= vegetation, aes(x=P, y=Pred_diff_sp))+
+  geom_point()+
+  ggtitle("Predicition Diff ~ P")
+p_pred_diff_H <- ggplot(data= vegetation, aes(x=H, y=Pred_diff_sp))+
+  geom_point()+
+  ggtitle("Predicitions Diff ~ H")
+p_pred_err_P <- ggplot(data= vegetation, aes(x=P, y=exp(Pred_err_sp)))+
+  geom_point()+
+  ggtitle("Predicitions Error ~ P")
+p_pred_err_H <- ggplot(data= vegetation, aes(x=H, y=exp(Pred_err_sp)))+
+  geom_point()+
+  ggtitle("Predicitions Error ~ H")
+
+grid.arrange(p_pred_diff_P, p_pred_diff_H, p_pred_err_P,p_pred_err_H, nrow=2, ncol=2)
+
+##3D plots
+plot_3d_diff <- plot_ly(vegetation, 
+             x = ~P, y=~H, z =~Pred_diff_sp,
+             color=~Fit_diff_sp) %>%
+  add_markers() %>%
+  layout(title = "Predicted values Difference",
+         scene = list(xaxis=list(title="P"),
+                      yaxis=list(title="H"),
+                      zaxis=list(title="Pred Difference")))
+plot_3d_diff
+
+plot_3d_err <- plot_ly(vegetation, 
+             x = ~P, y=~H, z =~Pred_err_sp,
+             color=~Fit_err_sp) %>%
+  add_markers() %>%
+  layout(title = "Predicted values Error",
+         scene = list(xaxis=list(title="P"),
+                      yaxis=list(title="H"),
+                      zaxis=list(title="Pred Error")))
+plot_3d_err
+```
+
+
+
+#Plots for interpolations
+
+```{r}
+p_int_diff_P <- ggplot(data= filter(interpol_df, H==32.5 |H==57.5),
+                       aes(x=Pstd, y=Int_diff_mean, col=as.factor(H)))+
+  geom_point()+
+  ggtitle("Interpolations Diff ~ P")
+p_int_diff_H <- ggplot(data= filter(interpol_df, Pstd==0.25 |Pstd==0.75),
+                       aes(x=H, y=Int_diff_mean, col=as.factor(Pstd)))+
+  geom_point()+
+  ggtitle("Interpolations Diff ~ H")
+p_int_err_P <- ggplot(data= filter(interpol_df, H==32.5 |H==57.5),
+                      aes(x=Pstd, y=exp(Int_err_mean), col=as.factor(H) ))+
+  geom_point()+
+  ggtitle("Interpolations Error ~ P")
+p_int_err_H <- ggplot(data= filter(interpol_df, Pstd==0.25 |Pstd==0.75),
+                      aes(x=H, y=exp(Int_err_mean), col=as.factor(Pstd)))+
+  geom_point()+
+  ggtitle("Interpolations Error ~ H")
+
+grid.arrange(p_int_diff_P, p_int_diff_H, p_int_err_P,p_int_err_H, nrow=2, ncol=2)
+
+#3Dplot
+Interpol_diff_3D <- plot_ly(data = interpol_df, x = ~H, y = ~Pstd, z=~Int_diff_mean, color=~Int_diff_mean)  %>% add_markers() %>%
+  layout(title = "Change (Difference) in dune height",
+  scene = list(
+    xaxis = list(title = "JC"),
+    yaxis = list(title = "P"),
+    zaxis = list(title = "Height change (m)")))
+Interpol_diff_3D
+
+Interpol_err_3D <- plot_ly(data = interpol_df, x = ~H, y = ~Pstd, z=~exp(Int_err_mean), color=~exp(Int_err_mean))  %>% add_markers() %>%
+  layout(title = "Variability in change (Error) in dune height",
+  scene = list(
+    xaxis = list(title = "JC"),
+    yaxis = list(title = "P"),
+    zaxis = list(title = "Var height change (m)")))
+Interpol_err_3D
+
+#write.csv(interpol_df, "output/Interpolations_INLA_fielddata.csv")
+#write.csv(vegetation, "output/Data_and_predictions_INLA_fielddata.csv")
+```
+

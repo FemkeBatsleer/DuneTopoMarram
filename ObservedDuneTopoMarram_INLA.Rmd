@@ -92,12 +92,12 @@ vegetation <- vegetation %>% left_join(suppletions, by="ID_sectie") %>% #get sup
 ```{r}
 #1. Outliers
 #Cleveland dotcharts see Zuur et al 2010 doi: 10.1111/j.2041-210X.2009.00001.x
-par(mfrow = c(1,4))
-dotchart(vegetation$P, main="P")
-dotchart(vegetation$H, main="H")
-dotchart(vegetation$mean_diff, main="mean_diff") #maybe two outlier in mean_diff on the left
-dotchart(vegetation$sd_diff, main="sd_diff")
-dotchart(vegetation$meandV, main="dV")
+# par(mfrow = c(1,4))
+# dotchart(vegetation$P, main="P")
+# dotchart(vegetation$H, main="H")
+# dotchart(vegetation$mean_diff, main="mean_diff") #maybe two outlier in mean_diff on the left
+# dotchart(vegetation$sd_diff, main="sd_diff")
+# dotchart(vegetation$meandV, main="dV")
 
 #2. Multicollinearity between covariates
 #correlation
@@ -331,6 +331,8 @@ summary(M1_err)
 #save(M1_diff, file="output/M1_diff.rda")
 #save(M1_err, file="output/M1_err.rda")
 
+load("output/M1_diff.rda")
+load("output/M1_err.rda")
 ###Plotting spatial autocorrelation of residuals
 ##Fitted values and residuals
 #index of the fitted values
@@ -378,7 +380,7 @@ p_variogram_diff <- ggplot() +
   geom_point(data = V1_diff,aes(x = dist, y = gamma)) + 
   geom_line(data = V1_diff,aes(x = dist, y = gamma),col = "blue")+
   #scale_x_continuous(limits=c(0,50))+
-  ggtitle("Semi-variogram for mean_diff")+
+  ggtitle("Semi-variogram for \u0394height")+
   xlab("Distance (km)") +
   ylab("Cressie's Semi-variance") + 
   theme(text = element_text(size = 15)) + 
@@ -393,8 +395,8 @@ p_variogram_err <- ggplot() +
   geom_point(data = V1_err,aes(x = dist, y = gamma)) +
   geom_line(data = V1_err,aes(x = dist, y = gamma),col = "blue")+
   #scale_x_continuous(limits=c(0,50))+
-  ggtitle("Semi-variogram for sd_diff")+
-  xlab("Distance") +
+  ggtitle("Semi-variogram for CV")+
+  xlab("Distance (km)") +
   ylab("Cressie's Semi-variance") +
   theme(text = element_text(size = 15)) +
   theme_classic()
@@ -549,7 +551,7 @@ p_err
 ###Spatial field plots####
 #contour
 DSN <- "data/Study_Area_westkust.shp"
-boundary <- readOGR(dsn = DSN, layer = "data/Study_Area_westkust")
+boundary <- readOGR(dsn = DSN, layer = "Study_Area_westkust")
 x1 <- c(22100, 22100, 39900, 39900) 
 y1 <- c(198700, 209000, 209000, 198700)
 # Make a polygon of it.

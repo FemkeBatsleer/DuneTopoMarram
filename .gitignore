@@ -4,3 +4,10 @@
 .Ruserdata
 .rda
 .png
+figures/
+output/M0_diff.rda
+output/M0_err.rda
+output/M1_diff.rda
+output/M1_err.rda
+output/mesh_diff.rda
+output/mesh_err.rda

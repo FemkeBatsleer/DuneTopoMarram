@@ -5,6 +5,7 @@
 .rda
 .png
 figures/
+figures/.png
 output/M0_diff.rda
 output/M0_err.rda
 output/M1_diff.rda
